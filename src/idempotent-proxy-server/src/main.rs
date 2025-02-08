@@ -22,7 +22,7 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[tokio::main]
 async fn main() {
-    dotenv().expect(".env file not found");
+    let _ = dotenv();
 
     Builder::with_level(&get_env_level().to_string())
         .with_target_writer("*", new_writer(tokio::io::stdout()))
