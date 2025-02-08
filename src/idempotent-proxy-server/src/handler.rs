@@ -24,6 +24,7 @@ pub struct AppState {
     pub header_vars: Arc<HashMap<String, HeaderValue>>,
     pub ecdsa_pub_keys: Arc<Vec<ecdsa::VerifyingKey>>,
     pub ed25519_pub_keys: Arc<Vec<ed25519_dalek::VerifyingKey>>,
+    pub user: String,
 }
 
 impl AppState {
@@ -34,6 +35,7 @@ impl AppState {
         headers.remove(&HEADER_X_FORWARDED_FOR);
         headers.remove(&HEADER_X_FORWARDED_HOST);
         headers.remove(&HEADER_X_FORWARDED_PROTO);
+        headers.remove(&HEADER_RANGE);
 
         if !self.header_vars.is_empty() {
             for val in headers.values_mut() {
@@ -169,9 +171,21 @@ pub async fn proxy(
         let json_mask = extract_header(req.headers(), &HEADER_X_JSON_MASK, || "".to_string());
         let response_headers =
             extract_header(req.headers(), &HEADER_RESPONSE_HEADERS, || "".to_string());
+        let header_range = extract_header(req.headers(), &HEADER_RANGE, || "".to_string());
 
         let mut headers = req.headers().clone();
         app.alter_headers(&mut headers);
+        if !app.user.is_empty() {
+            headers.insert(
+                http::header::AUTHORIZATION,
+                format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode(app.user)
+                )
+                .parse()
+                .unwrap(),
+            );
+        }
 
         let mut rreq = reqwest::Request::new(method.clone(), url.clone());
         *rreq.headers_mut() = headers;
@@ -185,18 +199,69 @@ pub async fn proxy(
 
         let rres = app.http_client.execute(rreq).await.map_err(bad_gateway)?;
         let status = rres.status();
-        let headers = rres.headers().to_owned();
+        let mut headers = rres.headers().to_owned();
         let res_body = rres.bytes().await.map_err(bad_gateway)?;
 
         // If the HTTP status code is 500 or below, it's considered a server response and should be cached; any exceptions should be handled by the client. Otherwise, it's considered a non-response from the server and should not be cached.
         if status >= StatusCode::OK && status <= StatusCode::INTERNAL_SERVER_ERROR {
-            let mut rd = ResponseData::new(status.as_u16());
-            rd.with_headers(&headers, &response_headers);
-            rd.with_body(&res_body, &json_mask).map_err(bad_gateway)?;
-            let data = rd.to_bytes().map_err(bad_gateway)?;
+            let (status_code, body) = if !header_range.is_empty() {
+                let range = header_range
+                    .trim_start_matches("bytes=")
+                    .split('-')
+                    .collect::<Vec<&str>>();
 
-            let _ = app
-                .cacher
+                let start = range[0].parse::<usize>().map_err(|_| {
+                    (
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                        "Invalid range format".to_string(),
+                    )
+                })?;
+                let end = range[1].parse::<usize>().map_err(|_| {
+                    (
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                        "Invalid range format".to_string(),
+                    )
+                })?;
+
+                let content_length = res_body.len();
+                if start >= content_length /*|| end >= content_length */|| start > end {
+                    return Err((
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                        format!(
+                            "Requested range {}-{} not satisfiable for content length {}",
+                            start, end, content_length
+                        ),
+                    ));
+                }
+
+                let partial = if end >= content_length {
+                    res_body[start..].to_vec()
+                } else {
+                    res_body[start..=end].to_vec()
+                };
+
+                headers.insert(
+                    http::header::CONTENT_RANGE,
+                    format!("bytes {}-{}/{}", start, end, content_length)
+                        .parse()
+                        .unwrap(),
+                );
+                headers.insert(
+                    http::header::CONTENT_LENGTH,
+                    format!("{}", partial.len()).parse().unwrap(),
+                );
+
+                (StatusCode::PARTIAL_CONTENT.as_u16(), partial)
+            } else {
+                (status.as_u16(), res_body.to_vec())
+            };
+
+            let mut rd = ResponseData::new(status_code);
+            rd.with_headers(&headers, &response_headers);
+            rd.with_body(&body, &json_mask).map_err(bad_gateway)?;
+
+            let data = rd.to_bytes().map_err(bad_gateway)?;
+            app.cacher
                 .set(&idempotency_key, data, app.cacher.cache_ttl)
                 .await
                 .map_err(bad_gateway)?;

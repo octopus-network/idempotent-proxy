@@ -22,12 +22,15 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[tokio::main]
 async fn main() {
-    dotenv().expect(".env file not found");
+    let _ = dotenv();
 
     Builder::with_level(&get_env_level().to_string())
         .with_target_writer("*", new_writer(tokio::io::stdout()))
         .init();
 
+    let user: String = std::env::var("USER")
+        .map(|u| if u.contains(':') { u } else { String::new() })
+        .unwrap_or_default();
     let req_timeout: u64 = std::env::var("REQUEST_TIMEOUT")
         .map(|n| n.parse().unwrap())
         .unwrap_or(10000u64)
@@ -117,6 +120,7 @@ async fn main() {
             header_vars: Arc::new(header_vars),
             ecdsa_pub_keys: Arc::new(ecdsa_pub_keys),
             ed25519_pub_keys: Arc::new(ed25519_pub_keys),
+            user,
         });
 
     let addr: SocketAddr = std::env::var("SERVER_ADDR")
