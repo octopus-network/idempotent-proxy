@@ -105,6 +105,7 @@ async fn main() {
     let handle = axum_server::Handle::new();
     let app = Router::new()
         .route("/*any", routing::any(handler::proxy))
+        .route("/", routing::any(handler::proxy))
         .with_state(handler::AppState {
             http_client: Arc::new(http_client),
             cacher: Arc::new(cache::HybridCacher::new(
